@@ -1,0 +1,38 @@
+# Build output and caches only. Nothing here may exclude first-party source:
+# analyzers/gitignore_check.py will flag this file if it ever does, and running
+# Chronicle on Chronicle is part of the submission (spec §10, hours 44-48).
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.venv/
+venv/
+
+.DS_Store
+.idea/
+.vscode/
+
+# Local HACKPROOF state: a roster and the enrollment cards it is built from carry
+# participants' public keys and email addresses, which is personal data under the
+# retention policy in spec §11. Keep them out of git and delete them after judging.
+#
+# These must cover every path analyzers/gpg_check.py:ROSTER_CANDIDATES actually
+# looks in, or the default location is the one that leaks. `*.roster.json` alone
+# did not: the candidate filenames are `hackproof-roster.json` and
+# `chronicle-roster.json`, which end in `-roster.json`, not `.roster.json`.
+.hackproof/
+.chronicle/
+roster.json
+*-roster.json
+*.roster.json
+enrollment-*.json

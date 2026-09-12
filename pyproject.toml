@@ -1,0 +1,29 @@
+[project]
+name = "hackproof"
+version = "0.1.0"
+description = "Hackathon build-provenance & integrity platform (HACKPROOF)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "analyzers*"]
+
+[project.scripts]
+# Runs every analyzer over one repo; see core/engine.py.
+hackproof-analyze = "core.engine:main"
+chronicle-analyze = "core.engine:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "slow: exercises a real clock (e.g. waits for a GPG key to expire)",
+]
