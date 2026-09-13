@@ -53,6 +53,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -211,6 +212,22 @@ def token() -> str | None:
         value = (os.environ.get(name) or "").strip()
         if value:
             return value
+    try:
+        res = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n",
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                if line.startswith("password="):
+                    pw = line.split("=", 1)[1].strip()
+                    if pw:
+                        return pw
+    except Exception:
+        pass
     return None
 
 

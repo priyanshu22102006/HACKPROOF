@@ -644,7 +644,27 @@ def main(argv: list[str] | None = None) -> int:
         if args.format != "json":
             print(f"==> Cloning remote repository '{slug}' for testing & analysis...")
 
-        token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+        token = (os.environ.get("HACKPROOF_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+        if not token:
+            try:
+                cred_res = subprocess.run(
+                    ["git", "credential", "fill"],
+                    input="protocol=https\nhost=github.com\n",
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if cred_res.returncode == 0:
+                    for line in cred_res.stdout.splitlines():
+                        if line.startswith("password="):
+                            token = line.split("=", 1)[1].strip()
+                            break
+            except Exception:
+                pass
+
+        if token:
+            os.environ.setdefault("GITHUB_TOKEN", token)
+
         cmd = ["git", "clone", "--no-single-branch", "--quiet", clone_url, repo_path]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if res.returncode != 0 and token and not clone_url.startswith(("git@", "ssh://")):
@@ -698,9 +718,20 @@ def main(argv: list[str] | None = None) -> int:
             "findings": [dataclasses.asdict(f) for f in findings],
         }
 
+        blame_entries = []
         if args.blame_ignore:
             from analyzers.gitignore_check import get_gitignore_blame_view
-            report["gitignore_blame"] = [e.to_dict() for e in get_gitignore_blame_view(repo_path)]
+            blame_entries = get_gitignore_blame_view(repo_path)
+            report["gitignore_blame"] = [e.to_dict() for e in blame_entries]
+
+        from core.context.engine import ContextAwarenessEngine
+        context_engine = ContextAwarenessEngine(repository=slug if is_remote else args.repo_path)
+        context_assessment = context_engine.analyze(
+            findings=findings,
+            blame_entries=blame_entries,
+            repo_path=repo_path,
+        )
+        report["context_awareness"] = context_assessment.to_dict()
 
         if args.format == "json":
             print(json.dumps(report, indent=2, default=str))
@@ -714,6 +745,8 @@ def main(argv: list[str] | None = None) -> int:
                     show_blame=args.blame_ignore,
                 )
             )
+            print("")
+            print(context_engine.render_terminal_summary(context_assessment))
 
         if args.out:
             try:
