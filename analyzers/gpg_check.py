@@ -408,8 +408,8 @@ def discover_roster_path(repo_path: str) -> str | None:
     return None
 
 
-def load_roster(path: str) -> dict:
-    """Parse and normalize a roster file. Collects errors instead of raising."""
+def load_roster(path: str, team_id: str | None = None) -> dict:
+    """Parse and normalize a roster file (JSON or SQLite DB). Collects errors instead of raising."""
     roster: dict = {
         "path": path,
         "team_id": None,
@@ -417,12 +417,49 @@ def load_roster(path: str) -> dict:
         "members": [],
         "errors": [],
     }
+    is_sqlite = False
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            raw = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+        with open(path, "rb") as f:
+            header = f.read(16)
+            if header.startswith(b"SQLite format 3"):
+                is_sqlite = True
+    except OSError as exc:
         roster["errors"].append({"reason": "ROSTER_UNREADABLE", "detail": str(exc)})
         return roster
+
+    if is_sqlite:
+        try:
+            from core.roster_db import RosterDatabase
+            db = RosterDatabase(path)
+            target_team = team_id or os.environ.get("HACKPROOF_TEAM_ID", "").strip() or None
+            teams = db.list_teams()
+            if not target_team:
+                if len(teams) == 1:
+                    target_team = teams[0].team_id
+                elif len(teams) == 0:
+                    roster["errors"].append({"reason": "NO_TEAMS_IN_DB", "detail": f"Database '{path}' has no registered teams"})
+                    db.close()
+                    return roster
+                else:
+                    team_list = ", ".join(t.team_id for t in teams)
+                    roster["errors"].append({
+                        "reason": "MULTIPLE_TEAMS_IN_DB",
+                        "detail": f"Database has {len(teams)} teams ({team_list}). Specify target team via --team-id or $HACKPROOF_TEAM_ID",
+                    })
+                    db.close()
+                    return roster
+            raw = db.export_team_roster(target_team)
+            db.close()
+        except Exception as exc:
+            roster["errors"].append({"reason": "ROSTER_DB_ERROR", "detail": str(exc)})
+            return roster
+    else:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            roster["errors"].append({"reason": "ROSTER_UNREADABLE", "detail": str(exc)})
+            return roster
 
     if not isinstance(raw, dict):
         roster["errors"].append({"reason": "ROSTER_MALFORMED", "detail": "top level is not an object"})

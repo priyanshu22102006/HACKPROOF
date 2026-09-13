@@ -33,8 +33,11 @@ import argparse
 import dataclasses
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 
 try:
@@ -183,6 +186,7 @@ def run_all(
     only: list[str] | None = None,
     skip: list[str] | None = None,
     t0: str | None = None,
+    team_id: str | None = None,
 ) -> list[Finding]:
     """Run every selected analyzer over one repo and return the combined Findings.
 
@@ -196,6 +200,8 @@ def run_all(
         os.environ["CHRONICLE_ROSTER"] = resolved_roster
     if t0:
         os.environ["HACKPROOF_T0"] = t0
+    if team_id:
+        os.environ["HACKPROOF_TEAM_ID"] = team_id
 
     findings: list[Finding] = []
     try:
@@ -355,10 +361,15 @@ def render_table(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
-def render_summary_card(findings: list[Finding], repo_path: str = "") -> str:
+def render_summary_card(
+    findings: list[Finding],
+    repo_path: str = "",
+    target_label: str = "",
+    show_blame: bool = True,
+) -> str:
     """A clean, human-friendly summary box designed for judges, mentors, and developers."""
     summary = summarize(findings)
-    repo_name = os.path.basename(os.path.abspath(repo_path)) if repo_path else "Repository"
+    display_name = target_label if target_label else (os.path.basename(os.path.abspath(repo_path)) if repo_path else "Repository")
 
     hard_flags = summary.get("hard_flags", [])
     flags = summary.get("flags", [])
@@ -375,10 +386,11 @@ def render_summary_card(findings: list[Finding], repo_path: str = "") -> str:
     info_exclude = next((f for f in findings if f.check_name == "gitignore.info_exclude"), None)
 
     is_clean = (failed == 0 and not hard_flags and not flags)
+    border_len = 114
 
     lines = [
         "",
-        "═" * 78,
+        "═" * border_len,
     ]
     if is_clean:
         lines.append("  HACKPROOF AUDIT REPORT: ✅ ALL CHECKS PASSED (VERIFIED GENUINE WORK)")
@@ -387,21 +399,24 @@ def render_summary_card(findings: list[Finding], repo_path: str = "") -> str:
     else:
         lines.append(f"  HACKPROOF AUDIT REPORT: ⚠️  SUSPICIOUS ACTIVITY DETECTED ({failed} Issue{'s' if failed != 1 else ''})")
     lines.extend([
-        "─" * 78,
-        f"  Target Repository : {repo_name}",
+        "─" * border_len,
+        f"  Target Repository : {display_name}",
     ])
 
     # 1. Signature section
     if sig_coverage and isinstance(sig_coverage.evidence, dict) and sig_coverage.evidence.get("commit_count"):
         ev = sig_coverage.evidence
         total = ev.get("commit_count", 0)
-        verified = ev.get("verified_commit_count", 0)
-        ratio = ev.get("verified_ratio", 0.0)
-        percent = int(ratio * 100)
+        verified = ev.get("verified_commit_count")
+        ratio = ev.get("verified_ratio")
 
         lines.append("")
         lines.append("  [1] COMMIT SIGNATURE VERIFICATION (GPG / SSH)")
-        lines.append(f"      • Coverage: {verified}/{total} commits verified ({percent}%)")
+        if verified is not None and ratio is not None:
+            percent = int(ratio * 100)
+            lines.append(f"      • Coverage: {verified}/{total} commits verified ({percent}%)")
+        else:
+            lines.append(f"      • Coverage: Unattributed ({total} commit(s) present, no roster keyring provided)")
 
         # Unsigned commits
         unsigned_commits = ev.get("unsigned_commits", [])
@@ -438,7 +453,7 @@ def render_summary_card(findings: list[Finding], repo_path: str = "") -> str:
 
     # 2. Gitignore & Hidden Code section
     lines.append("")
-    lines.append("  [2] FILE CONCEALMENT & PRE-BUILT CODE INSPECTOR")
+    lines.append("  [2] FILE CONCEALMENT & PRE-BUILT CODE INSPECTOR (§8.f)")
     hidden_sources = (
         pattern_audit.evidence.get("hidden_source_files", [])
         if (pattern_audit and isinstance(pattern_audit.evidence, dict))
@@ -480,6 +495,19 @@ def render_summary_card(findings: list[Finding], repo_path: str = "") -> str:
     else:
         lines.append("      • Status: Clean (No hidden files, no pre-built code staging, no index manipulation).")
 
+    # Forensic Blame View Table integrated right here into the main output window
+    if show_blame and repo_path and os.path.isdir(repo_path):
+        from analyzers.gitignore_check import get_gitignore_blame_view, render_gitignore_blame_table
+        entries = get_gitignore_blame_view(repo_path)
+        if entries:
+            lines.append("")
+            lines.append("      • FORENSIC .GITIGNORE BLAME VIEW (§8.f):")
+            blame_tbl = render_gitignore_blame_table(entries)
+            for bline in blame_tbl.splitlines():
+                lines.append(f"        {bline}")
+        else:
+            lines.append("      • .gitignore: None found in repository working tree.")
+
     # 3. Claim-plane timestamp, build window & diff churn section
     build_window = next((f for f in findings if f.check_name == "claim.build_window"), None)
     parent_mono = next((f for f in findings if f.check_name == "claim.parent_monotonicity"), None)
@@ -489,8 +517,11 @@ def render_summary_card(findings: list[Finding], repo_path: str = "") -> str:
     churn_check = next((f for f in findings if f.check_name == "claim.diff_churn"), None)
 
     ts_issues = [
-        f for f in (build_window, parent_mono, tz_check, spread_check, quant_check, churn_check)
-        if f and not f.passed
+        f for f in findings
+        if (f.plane in ("claim", "server"))
+        and not f.passed
+        and not f.check_name.startswith("gpg.")
+        and not f.check_name.startswith("gitignore.")
     ]
     lines.append("")
     lines.append("  [3] HACKATHON BUILD WINDOW & TIMESTAMPS (§8.d / §8.i)")
@@ -521,7 +552,7 @@ def render_summary_card(findings: list[Finding], repo_path: str = "") -> str:
         lines.append(f"      • Status: Clean ({status_note}).")
 
     # 4. Takeaway
-    lines.append("─" * 78)
+    lines.append("─" * border_len)
     if is_clean:
         lines.append("  JUDGE TAKEAWAY: ✅ Verified genuine build provenance. Clear for hackathon judging.")
     elif hard_flags:
@@ -529,7 +560,7 @@ def render_summary_card(findings: list[Finding], repo_path: str = "") -> str:
     else:
         lines.append("  JUDGE TAKEAWAY: ⚠️  Incomplete signature coverage. Verify commits with the team.")
     lines.extend([
-        "═" * 78,
+        "═" * border_len,
         "",
     ])
     return "\n".join(lines)
@@ -571,41 +602,133 @@ def main(argv: list[str] | None = None) -> int:
         help="event start time, ISO 8601 (exported as $HACKPROOF_T0; enables spec §8.d check 1)",
     )
     parser.add_argument(
+        "--team-id",
+        default=None,
+        help="team ID to inspect if roster is an SQLite database (exported as $HACKPROOF_TEAM_ID)",
+    )
+    parser.add_argument(
+        "--blame-ignore",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="display forensic git blame view of .gitignore lines and their commit history (§8.f) [default: enabled]",
+    )
+    parser.add_argument(
         "--pull",
         action="store_true",
         help="run git pull before analyzing to automatically fetch latest remote commits from GitHub",
     )
     args = parser.parse_args(argv)
 
-    if args.pull:
-        subprocess.run(["git", "pull", "--quiet"], cwd=args.repo_path, check=False)
+    target = args.repo_path.strip()
+    is_remote = False
+    temp_workdir = None
+    slug = target
 
-    findings = run_all(
-        args.repo_path, roster_path=args.roster, only=args.only, skip=args.skip, t0=args.t0
-    )
-    report = {
-        "repo_path": os.path.abspath(os.path.expanduser(args.repo_path)),
-        "summary": summarize(findings),
-        "findings": [dataclasses.asdict(f) for f in findings],
-    }
+    url_match = re.search(r"(?:github\.com[:/])(?P<owner>[A-Za-z0-9._-]+)/(?P<repo>[A-Za-z0-9._-]+?)(?:\.git)?/?$", target)
+    slug_match = bool(re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", target)) and not os.path.exists(target) and not target.startswith((".", "/", "~"))
 
-    if args.format == "json":
-        print(json.dumps(report, indent=2, default=str))
-    else:
-        print(render_table(findings))
-        print(render_summary_card(findings, repo_path=args.repo_path))
+    if target.startswith(("http://", "https://", "git@", "ssh://")) or slug_match or url_match:
+        is_remote = True
+        if slug_match:
+            slug = target
+            clone_url = f"https://github.com/{slug}.git"
+        elif url_match:
+            slug = f"{url_match.group('owner')}/{url_match.group('repo')}"
+            clone_url = target if target.startswith(("git@", "ssh://")) else f"https://github.com/{slug}.git"
+        else:
+            slug = target
+            clone_url = target
 
-    if args.out:
-        try:
-            with open(args.out, "w", encoding="utf-8") as handle:
-                json.dump(report, handle, indent=2, default=str)
-        except OSError as exc:
-            print(f"could not write {args.out}: {exc}", file=sys.stderr)
+        temp_workdir = tempfile.mkdtemp(prefix="hackproof-clone-")
+        repo_path = os.path.join(temp_workdir, "repo")
+        if args.format != "json":
+            print(f"==> Cloning remote repository '{slug}' for testing & analysis...")
+
+        token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+        cmd = ["git", "clone", "--no-single-branch", "--quiet", clone_url, repo_path]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if res.returncode != 0 and token and not clone_url.startswith(("git@", "ssh://")):
+            authed_url = f"https://x-access-token:{token}@github.com/{slug}.git"
+            res = subprocess.run(["git", "clone", "--no-single-branch", "--quiet", authed_url, repo_path], capture_output=True, text=True, timeout=300)
+
+        if res.returncode != 0:
+            print(f"Error: Failed to clone repository '{slug}': {res.stderr.strip()}", file=sys.stderr)
+            shutil.rmtree(temp_workdir, ignore_errors=True)
             return 1
 
-    # Exit code is a convenience for CI, never a verdict: 0 clean, 1 something
-    # did not pass. The verdict engine (spec §8.i) is what ranks teams.
-    return 0 if all(f.passed for f in findings) else 1
+        os.environ["HACKPROOF_SOURCE"] = "clone"
+        os.environ.setdefault("HACKPROOF_GITHUB_REPO", slug)
+    else:
+        repo_path = os.path.abspath(os.path.expanduser(args.repo_path))
+        if not os.path.exists(repo_path):
+            print(f"Error: Target repository path '{args.repo_path}' does not exist.", file=sys.stderr)
+            print("\n💡 Hint: Provide the path to a git repository on your machine:", file=sys.stderr)
+            print("   • Audit current folder  : hackproof-analyze . --roster hackproof.db --team-id <team_id>", file=sys.stderr)
+            print("   • Audit remote GitHub   : hackproof-analyze owner/repo --roster hackproof.db --team-id <team_id>", file=sys.stderr)
+            print("   • Audit another folder  : hackproof-analyze ~/Desktop/YourRepo --roster hackproof.db --team-id <team_id>", file=sys.stderr)
+            return 1
+
+        if not os.path.isdir(repo_path):
+            print(f"Error: Target path '{args.repo_path}' is not a directory.", file=sys.stderr)
+            return 1
+
+        git_dir = os.path.join(repo_path, ".git")
+        if not os.path.exists(git_dir):
+            res = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo_path, capture_output=True, text=True)
+            if res.returncode != 0 or res.stdout.strip() != "true":
+                print(f"Error: Target directory '{args.repo_path}' is not a valid git repository (no .git directory found).", file=sys.stderr)
+                print("💡 Hint: Run this command inside or pointing to a valid git project directory.", file=sys.stderr)
+                return 1
+
+        if args.pull:
+            subprocess.run(["git", "pull", "--quiet"], cwd=repo_path, check=False)
+
+    try:
+        findings = run_all(
+            repo_path,
+            roster_path=args.roster,
+            only=args.only,
+            skip=args.skip,
+            t0=args.t0,
+            team_id=args.team_id,
+        )
+        report = {
+            "repo_path": slug if is_remote else os.path.abspath(os.path.expanduser(args.repo_path)),
+            "summary": summarize(findings),
+            "findings": [dataclasses.asdict(f) for f in findings],
+        }
+
+        if args.blame_ignore:
+            from analyzers.gitignore_check import get_gitignore_blame_view
+            report["gitignore_blame"] = [e.to_dict() for e in get_gitignore_blame_view(repo_path)]
+
+        if args.format == "json":
+            print(json.dumps(report, indent=2, default=str))
+        else:
+            print(render_table(findings))
+            print(
+                render_summary_card(
+                    findings,
+                    repo_path=repo_path,
+                    target_label=slug if is_remote else args.repo_path,
+                    show_blame=args.blame_ignore,
+                )
+            )
+
+        if args.out:
+            try:
+                with open(args.out, "w", encoding="utf-8") as handle:
+                    json.dump(report, handle, indent=2, default=str)
+            except OSError as exc:
+                print(f"could not write {args.out}: {exc}", file=sys.stderr)
+                return 1
+
+        # Exit code is a convenience for CI, never a verdict: 0 clean, 1 something
+        # did not pass. The verdict engine (spec §8.i) is what ranks teams.
+        return 0 if all(f.passed for f in findings) else 1
+    finally:
+        if temp_workdir:
+            shutil.rmtree(temp_workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

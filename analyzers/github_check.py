@@ -70,11 +70,15 @@ from analyzers import gpg_check
 CHECK_REPO_METADATA = "github.repo_metadata"
 CHECK_CROSSCHECK = "github.signature_crosscheck"
 CHECK_AUTHOR_LOGIN = "github.author_login_match"
+CHECK_FORCE_PUSH = "github.force_push"
+CHECK_PUSH_GAP = "github.push_gap"
 
 ALL_CHECKS = (
     (CHECK_REPO_METADATA, "server"),
     (CHECK_CROSSCHECK, "server"),
     (CHECK_AUTHOR_LOGIN, "server"),
+    (CHECK_FORCE_PUSH, "server"),
+    (CHECK_PUSH_GAP, "server"),
 )
 
 DEFAULT_API = "https://api.github.com"
@@ -528,11 +532,146 @@ def check_author_login(local_commits: list[dict], gh_commits: list[dict], roster
     return Finding(CHECK_AUTHOR_LOGIN, "server", "info", evidence, True)
 
 
+def check_force_push(slug: str, db_path: str | None = None) -> Finding:
+    evidence: dict = {
+        "mechanism": "webhook stream & server event store force-push audit (spec §8.d server check 3)",
+        "repo": slug,
+        "force_pushes": [],
+        "force_push_count": 0,
+    }
+    db_candidates = [
+        db_path,
+        os.environ.get("HACKPROOF_DB"),
+        "hackproof.db",
+        os.path.join(".hackproof", "hackproof.db"),
+    ]
+    found_db = None
+    for cand in db_candidates:
+        if cand and os.path.isfile(cand):
+            found_db = cand
+            break
+
+    if not found_db:
+        evidence["note"] = "no webhook database found; start hackproof-server to record real-time push events"
+        return Finding(CHECK_FORCE_PUSH, "server", "info", evidence, True)
+
+    try:
+        from core.roster_db import RosterDatabase
+        db = RosterDatabase(found_db)
+        fp_events = db.detect_force_pushes(slug)
+        db.close()
+    except Exception as exc:
+        evidence["note"] = f"could not query event store: {exc}"
+        return Finding(CHECK_FORCE_PUSH, "server", "info", evidence, True)
+
+    if fp_events:
+        evidence["force_pushes"] = [
+            {
+                "id": ev.id,
+                "before_sha": (ev.before_sha or "")[:12],
+                "after_sha": (ev.after_sha or "")[:12],
+                "received_at": ev.server_received_at,
+            }
+            for ev in fp_events[:MAX_EVIDENCE_ITEMS]
+        ]
+        evidence["force_push_count"] = len(fp_events)
+        evidence["interpretation"] = (
+            f"FORCE-PUSH DETECTED: {len(fp_events)} forced push event(s) recorded on GitHub. "
+            "Commit history was rewritten or dropped during the hackathon!"
+        )
+        return Finding(CHECK_FORCE_PUSH, "server", "hard_flag", evidence, False)
+
+    evidence["note"] = "no force-pushes recorded by webhook listener"
+    return Finding(CHECK_FORCE_PUSH, "server", "info", evidence, True)
+
+
+def check_push_gap(local_commits: list[dict], slug: str, db_path: str | None = None) -> Finding:
+    evidence: dict = {
+        "mechanism": "push-event server-timestamp vs commit author-date gap (spec §8.d server check 2)",
+        "repo": slug,
+        "large_gap_commits": [],
+        "large_gap_count": 0,
+    }
+    db_candidates = [
+        db_path,
+        os.environ.get("HACKPROOF_DB"),
+        "hackproof.db",
+        os.path.join(".hackproof", "hackproof.db"),
+    ]
+    found_db = None
+    for cand in db_candidates:
+        if cand and os.path.isfile(cand):
+            found_db = cand
+            break
+
+    if not found_db:
+        evidence["note"] = "no webhook database found; start hackproof-server or run hackproof-poll to audit push timing gaps"
+        return Finding(CHECK_PUSH_GAP, "server", "info", evidence, True)
+
+    try:
+        from core.roster_db import RosterDatabase
+        db = RosterDatabase(found_db)
+        push_events = db.get_github_events(repo_name=slug, event_type="push", limit=200)
+        db.close()
+    except Exception as exc:
+        evidence["note"] = f"could not query push events: {exc}"
+        return Finding(CHECK_PUSH_GAP, "server", "info", evidence, True)
+
+    if not push_events:
+        evidence["note"] = "no push events recorded for this repository in the database"
+        return Finding(CHECK_PUSH_GAP, "server", "info", evidence, True)
+
+    sha_push_times: dict[str, str] = {}
+    for pev in push_events:
+        payload = pev.payload or {}
+        p_commits = payload.get("commits", [])
+        for pc in p_commits:
+            c_id = pc.get("id")
+            if c_id:
+                sha_push_times[c_id] = pev.server_received_at
+        if pev.after_sha:
+            sha_push_times[pev.after_sha] = pev.server_received_at
+
+    large_gaps = []
+    MAX_GAP_SECONDS = 24 * 3600.0  # 24 hours
+
+    for commit in local_commits:
+        sha = commit.get("sha")
+        push_time_str = sha_push_times.get(sha)
+        if not push_time_str:
+            continue
+        c_dt = _parse_iso(commit.get("author_date"))
+        p_dt = _parse_iso(push_time_str)
+        if c_dt and p_dt:
+            gap_seconds = (p_dt - c_dt).total_seconds()
+            if gap_seconds > MAX_GAP_SECONDS:
+                large_gaps.append({
+                    "sha": sha[:12],
+                    "author": f"{commit.get('author_name')} <{commit.get('author_email')}>",
+                    "author_date": commit.get("author_date"),
+                    "server_pushed_at": push_time_str,
+                    "gap_hours": round(gap_seconds / 3600.0, 1),
+                })
+
+    evidence["large_gap_commits"] = large_gaps[:MAX_EVIDENCE_ITEMS]
+    evidence["large_gap_count"] = len(large_gaps)
+
+    if large_gaps:
+        evidence["interpretation"] = (
+            f"PUSH TIMING GAP DETECTED: {len(large_gaps)} commit(s) were authored >24h before "
+            "being pushed to GitHub. Indicates pre-written code committed locally before the hackathon."
+        )
+        return Finding(CHECK_PUSH_GAP, "server", "flag", evidence, False)
+
+    evidence["note"] = f"all {len(local_commits)} local commits matched push event timing within expected bounds"
+    return Finding(CHECK_PUSH_GAP, "server", "info", evidence, True)
+
+
 # --- entry point --------------------------------------------------------------
 
 
 def run(repo_path: str, roster_path: str | None = None, t0: str | None = None) -> list[Finding]:
-    """Three server-plane checks. Always returns one Finding each; never raises."""
+    """Five server-plane checks. Always returns one Finding each; never raises."""
     resolved = os.path.abspath(os.path.expanduser(str(repo_path)))
     if not os.path.isdir(resolved):
         return _skipped(resolved, "path does not exist or is not a directory")
@@ -569,6 +708,8 @@ def run(repo_path: str, roster_path: str | None = None, t0: str | None = None) -
             lambda: check_signature_crosscheck(local_commits, gh_commits, attribution_enabled),
         ),
         (CHECK_AUTHOR_LOGIN, "server", lambda: check_author_login(local_commits, gh_commits, roster)),
+        (CHECK_FORCE_PUSH, "server", lambda: check_force_push(slug)),
+        (CHECK_PUSH_GAP, "server", lambda: check_push_gap(local_commits, slug)),
     )
     for name, plane, fn in checks:
         try:

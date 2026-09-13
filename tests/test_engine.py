@@ -252,3 +252,21 @@ def test_history_check_is_absent_outside_a_git_repo(tmp_path):
     plain.mkdir()
     findings = run_all(str(plain))
     assert not [f for f in findings if f.check_name == "engine.history_completeness"]
+
+
+def test_main_rejects_nonexistent_or_nongit_path(tmp_path, capsys):
+    from core.engine import main
+    # 1. Non-existent path returns exit code 1 with clear hint
+    code = main(["/path/does/not/exist/ever"])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "does not exist" in err
+
+    # 2. Plain directory without git returns exit code 1
+    plain = tmp_path / "plain_dir"
+    plain.mkdir()
+    code = main([str(plain)])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "not a valid git repository" in err
+

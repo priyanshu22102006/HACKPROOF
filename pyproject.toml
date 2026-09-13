@@ -14,12 +14,15 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["core*", "analyzers*"]
+include = ["core*", "analyzers*", "server*"]
 
 [project.scripts]
 # Runs every analyzer over one repo; see core/engine.py.
 hackproof-analyze = "core.engine:main"
 chronicle-analyze = "core.engine:main"
+hackproof-roster = "core.roster_db:main"
+hackproof-server = "server.webhook_server:main"
+hackproof-poll = "server.github_service:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

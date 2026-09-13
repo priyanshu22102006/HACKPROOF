@@ -29,12 +29,13 @@ Design notes
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import dataclasses
 import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:  # allow both `python -m analyzers.gitignore_check` and direct execution
     from core.models import Finding
@@ -1011,6 +1012,203 @@ def run(repo_path: str) -> list[Finding]:
     return findings
 
 
+# --- .gitignore Forensic Blame View (§8.f) -----------------------------------
+
+
+@dataclasses.dataclass
+class GitignoreBlameEntry:
+    gitignore_path: str
+    line_number: int
+    pattern: str
+    sha: str
+    author: str
+    author_email: str
+    committed_at: str
+    is_initial: bool
+    hours_after_init: float
+    timing_label: str
+    classification: str  # "BENIGN", "SUSPICIOUS", "ACTIVE CONCEALMENT", "COMMENT"
+    hidden_files: list[str]
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+def get_repo_initial_commit(repo_path: str) -> tuple[str, int]:
+    """Returns (initial_commit_sha, initial_commit_epoch_seconds)."""
+    code, out, _ = _git(repo_path, ["rev-list", "--max-parents=0", "HEAD"])
+    if code != 0 or not out.strip():
+        return ("", 0)
+    root_sha = out.strip().splitlines()[-1]
+    code, ts_out, _ = _git(repo_path, ["show", "-s", "--format=%ct", root_sha])
+    epoch = int(ts_out.strip()) if code == 0 and ts_out.strip().isdigit() else 0
+    return (root_sha, epoch)
+
+
+def parse_gitignore_blame(repo_path: str, gitignore_rel_path: str) -> list[dict]:
+    """Parses git blame --line-porcelain output into structured per-line records."""
+    code, out, _ = _git(repo_path, ["blame", "--line-porcelain", "--", gitignore_rel_path])
+    if code != 0 or not out.strip():
+        return []
+
+    entries: list[dict] = []
+    current: dict = {}
+    for line in out.splitlines():
+        if not line:
+            continue
+        if line.startswith("\t"):
+            current["content"] = line[1:]
+            entries.append(current)
+            current = {}
+        elif not current:
+            parts = line.split()
+            current = {"sha": parts[0], "final_line": int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0}
+        else:
+            key, _, val = line.partition(" ")
+            if key == "author":
+                current["author"] = val
+            elif key == "author-mail":
+                current["author_email"] = val.strip("<>")
+            elif key == "author-time":
+                current["author_time"] = int(val) if val.isdigit() else 0
+            elif key == "author-tz":
+                current["author_tz"] = val
+            elif key == "summary":
+                current["summary"] = val
+    return entries
+
+
+def get_gitignore_blame_view(repo_path: str) -> list[GitignoreBlameEntry]:
+    """Forensic line-by-line attribution of .gitignore rules."""
+    resolved = os.path.abspath(os.path.expanduser(str(repo_path)))
+    if not is_git_repo(resolved) or not _has_commits(resolved):
+        return []
+
+    root_sha, init_epoch = get_repo_initial_commit(resolved)
+
+    hidden_by_line: dict[tuple[str, int], list[str]] = defaultdict(list)
+    try:
+        attribs = attribute_ignored_files(resolved, ignored_source_files(resolved))
+        for item in attribs:
+            src = item.get("source", "").replace(os.sep, "/")
+            line_no = item.get("line")
+            if src and line_no:
+                hidden_by_line[(src, line_no)].append(item.get("path", ""))
+    except Exception:
+        pass
+
+    gitignore_files = find_gitignore_files(resolved)
+    results: list[GitignoreBlameEntry] = []
+
+    for rel_path in gitignore_files:
+        blame_lines = parse_gitignore_blame(resolved, rel_path)
+        for bl in blame_lines:
+            line_no = bl.get("final_line", 0)
+            content = bl.get("content", "")
+            pattern = content.strip()
+            sha = bl.get("sha", "")
+            author = bl.get("author", "unknown")
+            email = bl.get("author_email", "")
+            auth_time = bl.get("author_time", 0)
+            auth_tz = bl.get("author_tz", "+0000")
+
+            try:
+                tz_sign = 1 if auth_tz.startswith("+") else -1
+                tz_hours = int(auth_tz[1:3]) if len(auth_tz) >= 3 else 0
+                tz_mins = int(auth_tz[3:5]) if len(auth_tz) >= 5 else 0
+                tz = timezone(tz_sign * timedelta(hours=tz_hours, minutes=tz_mins))
+                dt = datetime.fromtimestamp(auth_time, tz=tz)
+                date_str = dt.strftime("%Y-%m-%d %H:%M:%S %z")
+            except Exception:
+                date_str = str(auth_time)
+
+            is_initial = (sha == root_sha)
+            if init_epoch > 0 and auth_time >= init_epoch:
+                elapsed_hours = round((auth_time - init_epoch) / 3600.0, 1)
+            else:
+                elapsed_hours = 0.0
+
+            if is_initial:
+                timing_label = "[INIT]"
+            else:
+                timing_label = f"[LATE +{elapsed_hours:.1f}h]"
+
+            hidden_files = hidden_by_line.get((rel_path, line_no), [])
+
+            if not pattern or pattern.startswith("#"):
+                classification = "COMMENT"
+            elif hidden_files:
+                classification = "ACTIVE CONCEALMENT"
+                if not is_initial:
+                    timing_label += " 🚨"
+            else:
+                verdict = classify_pattern(pattern)
+                if verdict is None:
+                    classification = "BENIGN"
+                else:
+                    classification = "SUSPICIOUS"
+
+            results.append(
+                GitignoreBlameEntry(
+                    gitignore_path=rel_path,
+                    line_number=line_no,
+                    pattern=pattern,
+                    sha=sha[:7],
+                    author=author,
+                    author_email=email,
+                    committed_at=date_str,
+                    is_initial=is_initial,
+                    hours_after_init=elapsed_hours,
+                    timing_label=timing_label,
+                    classification=classification,
+                    hidden_files=hidden_files,
+                )
+            )
+
+    return results
+
+
+def render_gitignore_blame_table(entries: list[GitignoreBlameEntry]) -> str:
+    """Renders a formatted forensic terminal table for .gitignore lines."""
+    if not entries:
+        return "No .gitignore lines found."
+
+    lines = [
+        "┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐",
+        "│                               .GITIGNORE FORENSIC BLAME VIEW (§8.f)                                     │",
+        "├──────┬──────────────────────┬────────────────────┬─────────────────────────┬──────────────┬─────────────┤",
+        "│ Line │ Rule / Pattern       │ Author             │ Committed Date & Time   │ Timing       │ Status      │",
+        "├──────┼──────────────────────┼────────────────────┼─────────────────────────┼──────────────┼─────────────┤",
+    ]
+    for e in entries:
+        if e.classification == "COMMENT":
+            status_badge = "COMMENT"
+        elif e.classification == "ACTIVE CONCEALMENT":
+            status_badge = "🚨 CONCEALED"
+        elif e.classification == "SUSPICIOUS":
+            status_badge = "⚠️  SUSP     "
+        else:
+            status_badge = "✅ CLEAN    "
+
+        pat_disp = e.pattern[:20] if len(e.pattern) <= 20 else e.pattern[:17] + "..."
+        auth_disp = e.author[:18] if len(e.author) <= 18 else e.author[:15] + "..."
+        date_disp = e.committed_at[:23]
+        timing_disp = e.timing_label[:12]
+
+        lines.append(
+            f"│ {e.line_number:<4} │ {pat_disp:<20} │ {auth_disp:<18} │ {date_disp:<23} │ {timing_disp:<12} │ {status_badge:<11} │"
+        )
+        if e.hidden_files:
+            lines.append(f"│      ↳ 🚨 CONCEALED FILES ON DISK ({len(e.hidden_files)} files):")
+            for h in e.hidden_files[:4]:
+                lines.append(f"│        • {h}")
+            if len(e.hidden_files) > 4:
+                lines.append(f"│        ... and {len(e.hidden_files) - 4} more")
+
+    lines.append("└──────┴──────────────────────┴────────────────────┴─────────────────────────┴──────────────┴─────────────┘")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Inspect a git repository for hidden/untracked source code."
@@ -1019,7 +1217,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--compact", action="store_true", help="emit single-line JSON instead of indented"
     )
+    parser.add_argument(
+        "--blame", action="store_true", help="display forensic .gitignore blame view table"
+    )
     args = parser.parse_args(argv)
+
+    if args.blame:
+        entries = get_gitignore_blame_view(args.repo_path)
+        print(render_gitignore_blame_table(entries))
+        return 0
 
     findings = run(args.repo_path)
     payload = [dataclasses.asdict(f) for f in findings]

@@ -257,3 +257,44 @@ def test_nested_gitignore_hiding_directory_is_flagged(tmp_path):
         for rec in gitignore.evidence["hidden_source_files"]
     )
 
+
+def test_gitignore_blame_view_initial_vs_late(tmp_path):
+    from analyzers.gitignore_check import get_gitignore_blame_view, render_gitignore_blame_table
+    repo = init_repo(tmp_path)
+    # Commit 1: Initial housekeeping
+    write(repo, ".gitignore", "node_modules/\n__pycache__/\n")
+    write(repo, "README.md", "# project\n")
+    commit_all(repo, "initial commit")
+
+    # Commit 2: Late added rule
+    write(repo, ".gitignore", "node_modules/\n__pycache__/\nsrc/hidden_module/\n")
+    commit_all(repo, "late ignore rule")
+
+    # Working tree uncommitted file under the late pattern
+    write(repo, "src/hidden_module/algo.py", "def secret(): return 42\n")
+
+    blame_entries = get_gitignore_blame_view(repo)
+    assert len(blame_entries) == 3
+
+    # Entry 1 & 2: initial
+    assert blame_entries[0].line_number == 1
+    assert blame_entries[0].pattern == "node_modules/"
+    assert blame_entries[0].is_initial is True
+    assert blame_entries[0].timing_label == "[INIT]"
+    assert blame_entries[0].classification == "BENIGN"
+
+    # Entry 3: late added and actively concealing
+    assert blame_entries[2].line_number == 3
+    assert blame_entries[2].pattern == "src/hidden_module/"
+    assert blame_entries[2].is_initial is False
+    assert "LATE" in blame_entries[2].timing_label
+    assert blame_entries[2].classification == "ACTIVE CONCEALMENT"
+    assert "src/hidden_module/algo.py" in blame_entries[2].hidden_files
+
+    table = render_gitignore_blame_table(blame_entries)
+    assert "FORENSIC BLAME VIEW" in table
+    assert "src/hidden_module/" in table
+    assert "CONCEALED" in table
+    assert "src/hidden_module/algo.py" in table
+
+
